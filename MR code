@@ -1,0 +1,674 @@
+gwas_file <- "~/ILAE3_Caucasian_all_epilepsy_final.tbl"
+outcome_raw <- read.table(gwas_file,
+                          header = TRUE,
+                          sep = "",
+                          stringsAsFactors = FALSE,
+                          strip.white = TRUE)
+outcome_mr <- data.frame(
+  SNP = outcome_raw$MarkerName,
+  effect_allele = outcome_raw$Allele1,
+  other_allele = outcome_raw$Allele2,
+  beta = outcome_raw$Beta,
+  se = outcome_raw$SE,
+  pval = outcome_raw$P.value,
+  samplesize = outcome_raw$Effective_N,
+  effect_allele_freq = outcome_raw$Freq1,      
+  stringsAsFactors = FALSE
+)
+write.table(outcome_mr,
+            file = "~/ILAE3_Cau_all_epilepsy_MR_ready.txt",
+            sep = "\t",
+            row.names = FALSE,
+            quote = FALSE)
+
+metabolites <- c(
+"ApoA1","ApoB_by_ApoA1","Citrate","Citrate_by_Glucose","Gly_by_Citrate",
+"HDL_C","HDL_CE","HDL_FC","HDL_L","HDL_PL","HDL_size",
+"His","His_by_Citrate",
+"L_HDL_C","L_HDL_CE","L_HDL_FC","L_HDL_L","L_HDL_P","L_HDL_PL",
+"L_VLDL_TG",
+"M_HDL_C","M_HDL_FC","M_HDL_FC_pct",
+"Phe_by_Citrate",
+"S_HDL_PL_pct",
+"Tyr_by_Citrate",
+"VLDL_size",
+"XL_HDL_C_pct","XL_HDL_CE","XL_HDL_L","XL_HDL_P","XL_HDL_PL","XL_HDL_PL_pct"
+)
+
+final_results <- data.frame()
+for (met in metabolites){
+  print(paste("Running:", met))
+  exp_dat <- read_exposure_data(
+    filename = paste0("~/MR/Mets_QYX_noclump/",met,".tsv.gz"),
+    sep = "\t",
+    snp_col = "ID",
+    beta_col = "BETA",
+    se_col = "SE",
+    effect_allele_col = "A1",
+    other_allele_col = "AX",
+    eaf_col = "A1_FREQ",
+    pval_col = "P"
+  )
+  exp_dat <- exp_dat %>% filter(pval.exposure < 5e-8)
+  if(nrow(exp_dat) == 0) {
+    print(paste("No significant SNPs for", met))
+    next
+  }
+  exp_dat$rsid <- exp_dat$SNP
+  exp_dat$pval <- exp_dat$pval.exposure
+  set.seed(123)
+  exp_data_clump <- ld_clump_local(
+    dat = exp_dat,
+    clump_kb = 10000,
+    clump_r2 = 0.01,
+    clump_p = 1,
+    bfile = "~/MR/1kg.v3/EUR",
+    plink_bin = "~/bin/plink_Linux"
+  )
+  if(nrow(exp_data_clump) == 0) {
+    print(paste("No SNPs after clumping for", met))
+    next
+  }
+  out_epilepsy <- read_outcome_data(
+    snps = exp_data_clump$SNP,
+    filename = "~/ILAE3_Cau_all_epilepsy_MR_ready.txt",
+    sep = "\t",
+    snp_col = "SNP",
+    beta_col = "beta",
+    se_col = "se",
+    effect_allele_col = "effect_allele",
+    other_allele_col = "other_allele",
+    eaf_col = "effect_allele_freq",
+    pval_col = "pval"
+  )
+  if(nrow(out_epilepsy) == 0) {
+    print(paste("No matching SNPs in outcome for", met))
+    next
+  }
+  dat <- harmonise_data(exposure_dat = exp_data_clump, outcome_dat = out_epilepsy)
+  if(nrow(dat) == 0) {
+    print(paste("No SNPs after harmonisation for", met))
+    next
+  }
+  nsnp <- nrow(dat)
+  dat$F_stat <- (dat$beta.exposure^2) / (dat$se.exposure^2)
+  mean_F <- mean(dat$F_stat, na.rm = TRUE)
+  mr_result <- mr(dat)
+  mr_or <- generate_odds_ratios(mr_result)
+  heter <- mr_heterogeneity(dat)
+  if(nrow(heter) > 0) {
+    mr_or <- mr_or %>% left_join(heter %>% select(method, Q_pval), by = "method")
+    colnames(mr_or)[colnames(mr_or)=="Q_pval"] <- "heterogeneity_p"
+  } else {
+    mr_or$heterogeneity_p <- NA
+  }
+  if(nsnp >= 3) {
+    pleio <- mr_pleiotropy_test(dat)
+    mr_or$pleiotropy_p <- pleio$pval[1]
+  } else {
+    mr_or$pleiotropy_p <- NA
+  }
+  mr_or$metabolite <- met
+  mr_or$mean_F <- mean_F
+  mr_or$nsnp <- nsnp
+  final_results <- rbind(final_results, mr_or)
+}
+if(nrow(final_results) > 0) {
+  final_results <- final_results %>%
+    group_by(method) %>%
+    mutate(
+      FDR = p.adjust(pval, method = "fdr"),
+      Bonferroni = p.adjust(pval, method = "bonferroni")
+    ) %>% ungroup()
+}
+write.csv(
+  final_results,
+  "~/MR/result/Cau_all_new.csv",
+  row.names = FALSE
+)
+
+
+# Reverse MR
+# Exposure: ILAE 2023 all epilepsy
+# Outcome: 48 metabolites
+library(TwoSampleMR)
+library(ieugwasr)
+library(dplyr)
+exp_dat <- read_exposure_data(
+  filename = "~/ILAE3_Cau_focal_epilepsy_MR_ready.txt",
+  sep = "\t",
+  snp_col = "SNP",
+  beta_col = "beta",
+  se_col = "se",
+  effect_allele_col = "effect_allele",
+  other_allele_col = "other_allele",
+  eaf_col = "effect_allele_freq",
+  pval_col = "pval"
+)
+exp_dat <- exp_dat %>%
+  filter(pval.exposure < 5e-8)
+if (nrow(exp_dat) == 0) {
+  stop("No genome-wide significant SNPs for epilepsy.")
+}
+
+set.seed(123)
+exp_dat$rsid <- exp_dat$SNP
+exp_dat$pval <- exp_dat$pval.exposure
+exp_data_clump <- ld_clump_local(
+  dat = exp_dat,
+  clump_kb = 10000,
+  clump_r2 = 0.01,
+  clump_p = 1,
+  bfile = "~/MR/1kg.v3/EUR",
+  plink_bin = "~/bin/plink_Linux"
+)
+if (is.null(exp_data_clump) || nrow(exp_data_clump) == 0) {
+  stop("No SNPs after LD clumping for epilepsy.")
+}
+metabolites <- c(
+  "His",
+  "ApoB_by_ApoA1",
+  "Citrate_by_Glucose",
+  "Gly_by_Citrate",
+  "His_by_Citrate",
+  "Phosphatidylc_by_Total_TG",
+  "Tyr_by_Citrate",
+  "Tyr_by_Val",
+  "HDL_C",
+  "HDL_CE",
+  "HDL_FC",
+  "Citrate",
+  "HDL_L",
+  "HDL_PL",
+  "HDL_size",
+  "L_HDL_C",
+  "L_HDL_CE",
+  "L_HDL_FC",
+  "L_HDL_FC_pct",
+  "L_HDL_L",
+  "L_HDL_P",
+  "L_HDL_PL",
+  "L_VLDL_C",
+  "L_VLDL_FC",
+  "L_VLDL_L",
+  "L_VLDL_P",
+  "L_VLDL_PL",
+  "L_VLDL_TG",
+  "M_HDL_FC_pct",
+  "M_VLDL_TG",
+  "S_HDL_PL_pct",
+  "TG_by_PG",
+  "VLDL_TG",
+  "VLDL_size",
+  "XL_HDL_C",
+  "XL_HDL_CE",
+  "XL_HDL_C_pct",
+  "XL_HDL_FC",
+  "XL_HDL_FC_pct",
+  "XL_HDL_L",
+  "XL_HDL_P",
+  "XL_HDL_PL",
+  "XL_HDL_PL_pct",
+  "XL_VLDL_C",
+  "XL_VLDL_CE",
+  "XL_VLDL_L",
+  "XL_VLDL_P",
+  "XL_VLDL_TG"
+)
+stopifnot(length(metabolites) == 48)
+five_methods <- c(
+  "mr_ivw",
+  "mr_egger_regression",
+  "mr_weighted_median",
+  "mr_simple_mode",
+  "mr_weighted_mode"
+)
+
+all_results <- list()
+analysis_log <- list()
+all_snp_results <- list()
+result_index <- 1L
+log_index <- 1L
+snp_index <- 1L
+for (met in metabolites) {
+  file_path <- paste0(
+    "~/MR/Mets_QYX_noclump/",
+    met,
+    ".tsv.gz"
+  )
+  log_row <- data.frame(
+    Metabolite = met,
+    File_exists = file.exists(file_path),
+    Exposure_clumped_SNP_N = nrow(exp_data_clump),
+    Outcome_matched_SNP_N = NA_integer_,
+    Harmonised_SNP_N = NA_integer_,
+    MR_keep_SNP_N = NA_integer_,
+    Final_MR_SNP_N = NA_integer_,
+    Methods_run = NA_character_,
+    Status = NA_character_,
+    Message = NA_character_,
+    stringsAsFactors = FALSE
+  )
+  if (!file.exists(file_path)) {
+    log_row$Status <- "Failed"
+    log_row$Message <- "Metabolite file does not exist"
+    analysis_log[[log_index]] <- log_row
+    log_index <- log_index + 1L
+    next
+  }
+  out_dat <- tryCatch(
+    {
+      read_outcome_data(
+        snps = exp_data_clump$SNP,
+        filename = file_path,
+        sep = "\t",
+        snp_col = "ID",
+        beta_col = "BETA",
+        se_col = "SE",
+        effect_allele_col = "A1",
+        other_allele_col = "AX",
+        eaf_col = "A1_FREQ",
+        pval_col = "P"
+      )
+    },
+    error = function(e) {
+      log_row$Message <<- paste(
+        "Outcome reading error:",
+        conditionMessage(e)
+      )
+      NULL
+    }
+  )
+  if (is.null(out_dat) || nrow(out_dat) == 0) {
+    log_row$Outcome_matched_SNP_N <- 0L
+    log_row$Harmonised_SNP_N <- 0L
+    log_row$MR_keep_SNP_N <- 0L
+    log_row$Final_MR_SNP_N <- 0L
+    log_row$Status <- "Failed"
+    if (is.na(log_row$Message)) {
+      log_row$Message <- "No matching SNPs in metabolite GWAS"
+    }
+    analysis_log[[log_index]] <- log_row
+    log_index <- log_index + 1L
+    next
+  }
+  out_dat$outcome <- met
+  out_dat$id.outcome <- met
+  log_row$Outcome_matched_SNP_N <- nrow(out_dat)
+  dat_all <- tryCatch(
+    {
+      harmonise_data(
+        exposure_dat = exp_data_clump,
+        outcome_dat = out_dat,
+        action = 2
+      )
+    },
+    error = function(e) {
+      log_row$Message <<- paste(
+        "Harmonisation error:",
+        conditionMessage(e)
+      )
+      NULL
+    }
+  )
+  if (is.null(dat_all) || nrow(dat_all) == 0) {
+    log_row$Harmonised_SNP_N <- 0L
+    log_row$MR_keep_SNP_N <- 0L
+    log_row$Final_MR_SNP_N <- 0L
+    log_row$Status <- "Failed"
+    if (is.na(log_row$Message)) {
+      log_row$Message <- "No SNPs after harmonisation"
+    }
+    analysis_log[[log_index]] <- log_row
+    log_index <- log_index + 1L
+    next
+  }
+  log_row$Harmonised_SNP_N <- nrow(dat_all)
+  dat <- dat_all
+  if ("mr_keep" %in% names(dat)) {
+    log_row$MR_keep_SNP_N <- sum(
+      dat$mr_keep == TRUE,
+      na.rm = TRUE
+    )
+    dat <- dat %>%
+      filter(mr_keep == TRUE)
+  } else {
+    log_row$MR_keep_SNP_N <- nrow(dat)
+  }
+  dat <- dat %>%
+    filter(
+      !is.na(beta.exposure),
+      !is.na(se.exposure),
+      !is.na(beta.outcome),
+      !is.na(se.outcome),
+      se.exposure > 0,
+      se.outcome > 0
+    ) %>%
+    distinct(
+      SNP,
+      .keep_all = TRUE
+    )
+  nsnp <- nrow(dat)
+  log_row$Final_MR_SNP_N <- nsnp
+  if (nsnp == 0) {
+    log_row$Status <- "Failed"
+    log_row$Message <- "No valid SNPs after harmonisation"
+    analysis_log[[log_index]] <- log_row
+    log_index <- log_index + 1L
+    next
+  }
+  dat$F_stat <- (
+    dat$beta.exposure /
+      dat$se.exposure
+  )^2
+  mean_F <- mean(
+    dat$F_stat,
+    na.rm = TRUE
+  )
+  median_F <- median(
+    dat$F_stat,
+    na.rm = TRUE
+  )
+  minimum_F <- min(
+    dat$F_stat,
+    na.rm = TRUE
+  )
+  maximum_F <- max(
+    dat$F_stat,
+    na.rm = TRUE
+  )
+  weak_IV_N <- sum(
+    dat$F_stat < 10,
+    na.rm = TRUE
+  )
+  if (nsnp == 1) {
+    selected_methods <- c(
+      "mr_wald_ratio"
+    )
+  } else if (nsnp == 2) {
+    selected_methods <- c(
+      "mr_ivw"
+    )
+  } else {
+    selected_methods <- five_methods
+  }
+  log_row$Methods_run <- paste(
+    selected_methods,
+    collapse = "; "
+  )
+  mr_result <- tryCatch(
+    {
+      mr(
+        dat,
+        method_list = selected_methods
+      )
+    },
+    error = function(e) {
+      log_row$Message <<- paste(
+        "MR error:",
+        conditionMessage(e)
+      )
+      NULL
+    }
+  )
+  if (
+    is.null(mr_result) ||
+    nrow(mr_result) == 0
+  ) {
+    log_row$Status <- "Failed"
+    if (is.na(log_row$Message)) {
+      log_row$Message <- "MR returned no results"
+    }
+    analysis_log[[log_index]] <- log_row
+    log_index <- log_index + 1L
+    next
+  }
+  mr_result <- mr_result %>%
+    filter(
+      !is.na(b),
+      !is.na(se),
+      !is.na(pval)
+    )
+  if (nrow(mr_result) == 0) {
+    log_row$Status <- "Failed"
+    log_row$Message <- "All MR estimates were NA"
+    analysis_log[[log_index]] <- log_row
+    log_index <- log_index + 1L
+    next
+  }
+  mr_result <- mr_result %>%
+    mutate(
+      Beta_lci95 = b - 1.96 * se,
+      Beta_uci95 = b + 1.96 * se
+    )
+  heter <- NULL
+  if (nsnp >= 2) {
+    heter_methods <- intersect(
+      selected_methods,
+      c(
+        "mr_ivw",
+        "mr_egger_regression"
+      )
+    )
+    if (length(heter_methods) > 0) {
+      heter <- tryCatch(
+        {
+          mr_heterogeneity(
+            dat,
+            method_list = heter_methods
+          )
+        },
+        error = function(e) {
+          cat(
+            " -> Heterogeneity test error:",
+            conditionMessage(e),
+            "\n"
+          )
+          NULL
+        }
+      )
+    }
+  }
+  mr_result$heterogeneity_Q <- NA_real_
+  mr_result$heterogeneity_df <- NA_real_
+  mr_result$heterogeneity_p <- NA_real_
+  if (
+    !is.null(heter) &&
+    nrow(heter) > 0
+  ) {
+    for (i in seq_len(nrow(mr_result))) {
+      idx <- which(
+        heter$method ==
+          mr_result$method[i]
+      )
+      if (length(idx) > 0) {
+        idx <- idx[1]
+        mr_result$heterogeneity_Q[i] <-
+          heter$Q[idx]
+        mr_result$heterogeneity_df[i] <-
+          heter$Q_df[idx]
+        mr_result$heterogeneity_p[i] <-
+          heter$Q_pval[idx]
+      }
+    }
+  }
+  egger_intercept <- NA_real_
+  egger_intercept_se <- NA_real_
+  pleiotropy_p <- NA_real_
+  if (nsnp >= 3) {
+    pleio <- tryCatch(
+      {
+        mr_pleiotropy_test(dat)
+      },
+      error = function(e) {
+        cat(
+          " -> Egger intercept error:",
+          conditionMessage(e),
+          "\n"
+        )
+        NULL
+      }
+    )
+    if (
+      !is.null(pleio) &&
+      nrow(pleio) > 0
+    ) {
+      if (
+        "egger_intercept" %in%
+        names(pleio)
+      ) {
+        egger_intercept <-
+          pleio$egger_intercept[1]
+      }
+      if ("se" %in% names(pleio)) {
+        egger_intercept_se <-
+          pleio$se[1]
+      }
+      if ("pval" %in% names(pleio)) {
+        pleiotropy_p <-
+          pleio$pval[1]
+      }
+    }
+  }
+  mr_result$egger_intercept <- ifelse(
+    mr_result$method == "MR Egger",
+    egger_intercept,
+    NA_real_
+  )
+  mr_result$egger_intercept_se <- ifelse(
+    mr_result$method == "MR Egger",
+    egger_intercept_se,
+    NA_real_
+  )
+  mr_result$pleiotropy_p <- ifelse(
+    mr_result$method == "MR Egger",
+    pleiotropy_p,
+    NA_real_
+  )
+  mr_result$metabolite <- met
+  mr_result$nsnp <- nsnp
+  mr_result$mean_F <- mean_F
+  mr_result$median_F <- median_F
+  mr_result$minimum_F <- minimum_F
+  mr_result$maximum_F <- maximum_F
+  mr_result$weak_IV_N <- weak_IV_N
+  all_results[[result_index]] <-
+    mr_result
+  result_index <- result_index + 1L
+  snp_result <- dat %>%
+    mutate(
+      metabolite = met
+    )
+  all_snp_results[[snp_index]] <-
+    snp_result
+  snp_index <- snp_index + 1L
+  log_row$Status <- "Completed"
+  log_row$Message <- paste0(
+    nrow(mr_result),
+    " MR result(s) generated"
+  )
+  analysis_log[[log_index]] <-
+    log_row
+  log_index <- log_index + 1L
+}
+
+final_log <- bind_rows(analysis_log)
+if (length(all_results) == 0) {stop("No reverse MR results generated.")}
+final_results <- bind_rows(all_results)
+
+final_results <- final_results %>%
+  group_by(method) %>%
+  mutate(
+    Number_of_tests =
+      sum(!is.na(pval)),
+    FDR =
+      p.adjust(
+        pval,
+        method = "BH"
+      ),
+    Bonferroni =
+      p.adjust(
+        pval,
+        method = "bonferroni"
+      ),
+    Nominal_significant =
+      ifelse(
+        pval < 0.05,
+        "Yes",
+        "No"
+      ),
+    FDR_significant =
+      ifelse(
+        FDR < 0.05,
+        "Yes",
+        "No"
+      ),
+    Bonferroni_significant =
+      ifelse(
+        Bonferroni < 0.05,
+        "Yes",
+        "No"
+      )
+  ) %>%
+  ungroup()
+
+final_results <- final_results %>%
+  select(
+    metabolite,
+    exposure,
+    outcome,
+    method,
+    nsnp,
+    mean_F,
+    median_F,
+    minimum_F,
+    maximum_F,
+    weak_IV_N,
+    b,
+    se,
+    Beta_lci95,
+    Beta_uci95,
+    pval,
+    Number_of_tests,
+    FDR,
+    Bonferroni,
+    Nominal_significant,
+    FDR_significant,
+    Bonferroni_significant,
+    heterogeneity_Q,
+    heterogeneity_df,
+    heterogeneity_p,
+    egger_intercept,
+    egger_intercept_se,
+    pleiotropy_p,
+    everything()
+  ) %>%
+  arrange(
+    metabolite,
+    method
+  )
+
+output_dir <- paste0("~/MR/New_result0720/")
+if (!dir.exists(output_dir)) {
+  dir.create(
+    output_dir,
+    recursive = TRUE
+  )
+}
+
+write.csv(final_results,file.path(output_dir,"reverse_GE_epilepsy.csv"),row.names = FALSE,na = "")
+if (length(all_snp_results) > 0) {
+  final_snp_results <- bind_rows(
+    all_snp_results
+  )
+  write.csv(
+    final_snp_results,
+    file.path(
+      output_dir,
+      "reverse_GE_epilepsy_MR_SNPs.csv"
+    ),
+    row.names = FALSE,
+    na = ""
+  )
+}
+
