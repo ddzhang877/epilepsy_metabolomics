@@ -1,0 +1,127 @@
+=========================================提取PRS Target ID=========================================
+library(data.table)
+data<-as.data.frame(fread("~/phase123.csv"))
+data1<-data[,c("eid","epi_status")]
+data2<-subset(data1,data1$epi_status!="")
+length(data2$epi_status)
+data2$IID<-paste0(data2$eid,"_",data2$eid)
+fwrite(data2, "~/PRS/Data/phase123_epi_id", sep = "\t", quote = FALSE)
+id<-as.data.frame(fread("~/UKB_gene_v3_imp_qc_chr1.fam"))
+caucasion<-as.data.frame(fread("~/UKB_genetic/british_id.txt"))
+id<-subset(id,id$V2 %in% caucasion$V2)
+id<-subset(id,id$V2 %in% data2$eid)
+id<-id[,c(1,2)]
+colnames(id)<-c("FID","IID")
+fwrite(id, "~/PRS/Data/target_phase123_id", sep = "\t", quote = FALSE)
+
+#=========================================Base data=========================================
+gwas_file <- "~/ILAE3_Caucasian_all_epilepsy_final.tbl"
+data <- read.table(gwas_file,
+                          header = TRUE,
+                          sep = "",
+                          stringsAsFactors = FALSE,
+                          strip.white = TRUE)
+setDT(data)
+qc_gwas_for_prs <- function(data) { 
+  data <- data[!is.na(data$Beta) & !is.na(data$SE) & !is.na(data$P.value) & !is.na(MarkerName)]  
+  data[, OR := exp(Beta)]  
+  data <- data[
+    P.value > 0 & P.value <= 1 &
+    SE > 0 &
+    abs(Beta) < 5 &      
+    OR < 10 & OR > 0.1    
+  ]  
+  return(data)
+}
+
+data_qc <- qc_gwas_for_prs(data)
+data_qc<-subset(data_qc,data_qc$Freq1>0.01 & data_qc$Freq1<0.99) 
+data_qc<-data_qc[,-c(8,11)]
+data_qc<-subset(data_qc,!is.na(data_qc$CHR))
+data_qc <- data_qc[!duplicated(MarkerName) & MarkerName != ".", ]
+data_qc[, Allele1 := toupper(Allele1)]
+data_qc[, Allele2 := toupper(Allele2)]
+ambiguous <- (data_qc$Allele1 == "A" & data_qc$Allele2 == "T") |
+  (data_qc$Allele1 == "T" & data_qc$Allele2 == "A") |
+  (data_qc$Allele1 == "G" & data_qc$Allele2 == "C") |
+  (data_qc$Allele1 == "C" & data_qc$Allele2 == "G")
+data_qc <- data_qc[!ambiguous, ] 
+fwrite(data_qc, "~/PRS/Data/Base_after_QC.txt", sep = "\t", quote = FALSE)
+data_qc<-data_qc[,c("MarkerName","Allele1","Allele2","Beta","P.value")]
+colnames(data_qc)<-c("SNP","A1","A2","BETA","P")
+fwrite(data_qc, "~/PRS/Data/Base_after_QC_PRSCSinput_beta.txt", sep = "\t", quote = FALSE)
+
+#准备纳入研究的ID的基因型数据#
+#!/bin/bash
+for i in {1..22}
+do
+~/software/plink2 \
+--bfile ~/UKB_gene_v3_imp_qc_chr${i} \
+--maf 0.01 \
+--hwe 1e-6 \
+--geno 0.05 \
+--mind 0.05 \
+--keep ~/PRS/Data/target_phase123_id \
+--threads 10 \
+--make-bed \
+--out ~/PRS/Data/UKB_target_array_QC/UKB_gene_v3_imp_qc_chr${i}
+echo "染色体 ${i} QC完成"
+done
+echo "全部22条染色体QC完成！"
+
+
+#!/bin/bash
+mkdir -p ~/result/associa_phase/PRS/PRScs/prscs_beta_out
+for chrom in {1..22}
+do
+    echo "=========================================="
+    python3 ~/PRScs/PRScs.py \
+    --ref_dir=~/ld_ref/ldblk_ukbb_eur \
+    --bim_prefix=~/PRS/Data/UKB_target_array_QC/UKB_gene_v3_imp_qc_chr${chrom} \
+    --sst_file=~/PRS/Data/Base_after_QC_PRSCSinput_beta.txt \
+    --n_gwas=82482 \
+    --chrom=${chrom} \
+    --seed=123 \
+    --out_dir=~/result/associa_phase/PRS/PRScs/prscs_beta_out/chr${chrom}
+    echo ""
+done
+echo "全部22条染色体处理完成！"
+EOF
+
+for chrom in {1..22}
+do
+~/software/plink2 \
+--bfile ~/PRS/Data/UKB_target_array_QC/UKB_gene_v3_imp_qc_chr${chrom} \
+--score ~/PRS/PRScs/prscs_beta_out/chr${chrom}_pst_eff_a1_b0.5_phiauto_chr${chrom}.txt 2 4 6 list-variants cols=+scoresums \
+--chr ${chrom} \
+--out epi.chr${chrom}
+done
+
+library(data.table) 
+prs_list <- list()
+for (chr in 1:22) {
+  file_name <- sprintf("epi.chr%d.sscore", chr)
+  if (file.exists(file_name)) {
+    dt <- fread(file_name, select = c(2, 6), skip = 1, col.names = c("IID", paste0("chr", chr)))
+    if (length(prs_list) == 0) {
+      prs_list[[1]] <- dt
+    } else {
+      prs_list[[1]] <- merge(prs_list[[1]], dt, by = "IID", all = TRUE)
+    }
+  } else {
+    message(sprintf("Warning: File %s not found", file_name))
+  }
+}
+prs_table <- prs_list[[1]]
+chr_cols <- grep("^chr", names(prs_table), value = TRUE)
+prs_table$PRScs <- rowSums(prs_table[, ..chr_cols], na.rm = TRUE)
+prs_table<-prs_table[,c(1,24)]
+fwrite(prs_table, file = "~/PRS/PRScs/PRScs.txt", sep = "\t")
+
+
+
+
+
+
+
+
