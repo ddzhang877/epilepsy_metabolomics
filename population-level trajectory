@@ -1,0 +1,738 @@
+get_script_dir <- function() {
+  args <- commandArgs(trailingOnly = FALSE)
+  file_arg <- grep("^--file=", args, value = TRUE)
+  if (length(file_arg) == 0) return(getwd())
+  dirname(normalizePath(sub("^--file=", "", file_arg[1])))
+}
+source(file.path(get_script_dir(), "trajectory_analysis_core.R"))
+# ---- User paths ----
+work_dir <- "~/trajectory/incident_main/"
+data_file <- "phase3.csv"
+# ---- Main-analysis settings ----
+# Do not set an artificial 17.5-year window. The function uses observed support
+# and avoids a grid beyond observed follow-up after matching.
+run_trajectory_analysis(
+  analysis_kind = "pre_diagnosis",
+  work_dir = work_dir,
+  data_dir = data_dir,
+  data_file = data_file,
+  output_prefix = "pre_diagnosis_main",
+  include_time0 = FALSE,
+  lag_years = 0,
+  user_max_years_before_diagnosis = Inf,
+  time_step = 0.5,
+  anchor_tolerance_years = 0.5,
+  match_ratio = 10,
+  min_controls_with_data = 3,
+  caliper = 0.2,
+  loess_span = 0.3,
+  loess_degree = 2,
+  loess_family = "gaussian",
+  k_mode = "auto",
+  manual_k = 3,
+  k_max = 6,
+  min_cluster_size = 3,
+  met_start = 25,
+  met_end = 337,
+  raw_z_cap = 2,
+  heatmap_cell_width_mm = 1.8,
+  heatmap_cell_height_mm = 3.0
+)
+
+
+
+================trajectory_analysis_core.R================
+#!/usr/bin/env Rscript
+user_libs <- c(
+  "/public/home/zhangdd/R/x86_64-pc-linux-gnu-library/4.2",
+  "/cwStorage/home/zhangdd/R/x86_64-pc-linux-gnu-library/4.2"
+)
+user_libs <- user_libs[dir.exists(user_libs)]
+.libPaths(unique(c(user_libs, .libPaths())))
+suppressPackageStartupMessages({
+  library(data.table)
+  library(MatchIt)
+  library(dplyr)
+  library(tidyr)
+  library(purrr)
+  library(stringr)
+  library(ggplot2)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(viridis)
+  library(patchwork)
+  library(cluster)
+  library(grid)
+})
+`%||%` <- function(x, y) if (is.null(x)) y else x
+bt <- function(x) paste0("`", gsub("`", "", x), "`")
+safe01 <- function(x) {
+  x_chr <- as.character(x)
+  dplyr::case_when(
+    x_chr %in% c("1", "case", "Case", "TRUE", "T", "yes", "Yes", "Y") ~ 1L,
+    x_chr %in% c("0", "control", "Control", "FALSE", "F", "no", "No", "N") ~ 0L,
+    TRUE ~ suppressWarnings(as.integer(x_chr))
+  )
+}
+
+is_definite_zero <- function(x) {
+  x_chr <- as.character(x)
+  !is.na(x_chr) & x_chr %in% c("0", "FALSE", "F", "no", "No", "N")
+}
+
+sanitize_tag <- function(x) {
+  x <- gsub("[^A-Za-z0-9_]+", "_", x)
+  x <- gsub("_+", "_", x)
+  x <- gsub("^_|_$", "", x)
+  x
+}
+
+# Choose default association files used to define significant metabolites.
+default_assoc_files <- function(data_dir) {
+  base_assoc <- file.path(data_dir, "result/associa_phase/")
+  choose_existing <- function(candidates) {
+    paths <- file.path(base_assoc, candidates)
+    existing <- paths[file.exists(paths)]
+    if (length(existing) > 0) return(existing[1])
+    paths[1]
+  }
+  c(
+    phase3_inc = choose_existing(c("phase3_incident_model2.csv")),
+    phase12_inc = choose_existing(c("phase12_incident_model2.csv")),
+    phase3_prev = choose_existing(c("phase3_pre_logistic_model2.csv")),
+    phase12_prev = choose_existing(c("phase12_pre_logistic_model2.csv"))
+  )
+}
+
+extract_sig_metabolites <- function(files, p_col = "Bon", p_cutoff = 0.05) {
+  extract_sig <- function(file) {
+    if (!file.exists(file)) stop("文件不存在：", file)
+    df <- data.table::fread(file)
+    if (!p_col %in% names(df)) stop("文件缺少 ", p_col, " 列：", file)
+    unique(df[get(p_col) < p_cutoff][[1]])
+  }
+  sig_list <- purrr::map(files, extract_sig)
+  cat("\n各关联结果中显著代谢物数量：\n")
+  print(purrr::map_int(sig_list, length))
+  sig_metabolites <- Reduce(intersect, sig_list)
+  if (length(sig_metabolites) == 0) stop("显著代谢物交集为空。")
+  sig_metabolites
+}
+
+make_grid_from_observed <- function(year_values, time_step = 0.5, analysis_kind = "pre_diagnosis",
+                                    lag_years = 0, anchor_tolerance_years = NULL) {
+  year_values <- year_values[is.finite(year_values)]
+  if (length(year_values) < 2) stop("用于生成时间网格的 Year 数量不足。")
+  anchor_tolerance_years <- anchor_tolerance_years %||% time_step
+  obs_min <- min(year_values)
+  obs_max <- max(year_values)
+  grid_min <- ceiling(obs_min / time_step) * time_step
+  grid_max <- floor(obs_max / time_step) * time_step
+  # For pre-diagnosis, the natural anchor is -lag_years; for main analysis lag=0.
+  # We only include the anchor endpoint when it is within one grid step of observed support.
+  if (analysis_kind == "pre_diagnosis") {
+    anchor <- -lag_years
+    if ((anchor - obs_max) >= 0 && (anchor - obs_max) <= anchor_tolerance_years) {
+      grid_max <- anchor
+    }
+  } else if (analysis_kind == "post_diagnosis") {
+    anchor <- lag_years
+    if ((obs_min - anchor) >= 0 && (obs_min - anchor) <= anchor_tolerance_years) {
+      grid_min <- anchor
+    }
+  }
+  if (grid_min > grid_max) {
+    warning("规则化时间网格为空，改用观测范围端点。")
+    return(sort(unique(c(obs_min, obs_max))))
+  }
+  seq(grid_min, grid_max, by = time_step)
+}
+
+plot_heatmap_matrix <- function(mat, cluster_sort, k, cluster_colors_k, group_colors,
+                                output_file, title, legend_title,
+                                value_breaks = NULL, value_labels = NULL,
+                                cell_width_mm = 1.8, cell_height_mm = 3.0,
+                                col_fun, show_row_names = TRUE) {
+  cluster_anno <- factor(cluster_sort$cluster, levels = seq_len(k))
+  names(cluster_anno) <- cluster_sort$Metabolite
+  group_anno <- cluster_sort$Group
+  group_anno[is.na(group_anno)] <- "Unknown"
+  names(group_anno) <- cluster_sort$Metabolite
+  row_ha <- rowAnnotation(
+    Cluster = cluster_anno,
+    Group = group_anno,
+    col = list(Cluster = cluster_colors_k, Group = group_colors),
+    annotation_name_side = "top",
+    show_annotation_name = TRUE,
+    annotation_name_gp = gpar(fontsize = 9),
+    na_col = "grey90",
+    annotation_legend_param = list(
+      Cluster = list(title = "Cluster", title_gp = gpar(fontsize = 10), labels_gp = gpar(fontsize = 8), nrow = 1, direction = "horizontal"),
+      Group = list(title = "Group", title_gp = gpar(fontsize = 10), labels_gp = gpar(fontsize = 8), nrow = 2, direction = "horizontal")
+    )
+  )
+  hm_width <- unit(ncol(mat) * cell_width_mm, "mm")
+  hm_height <- unit(nrow(mat) * cell_height_mm, "mm")
+  pdf_width <- max(8, (ncol(mat) * cell_width_mm + 95) / 25.4)
+  pdf_height <- max(6, (nrow(mat) * cell_height_mm + 45) / 25.4)
+  if (is.null(value_breaks)) {
+    rng <- range(mat, na.rm = TRUE)
+    m <- max(abs(rng))
+    if (!is.finite(m) || m == 0) m <- 1
+    value_breaks <- c(-round(m, 1), 0, round(m, 1))
+    value_labels <- value_breaks
+  }
+  pdf(output_file, width = pdf_width, height = pdf_height)
+  ht <- Heatmap(
+    mat,
+    name = legend_title,
+    col = col_fun,
+    right_annotation = row_ha,
+    column_title = title,
+    column_title_side = "top",
+    column_names_side = "top",
+    cluster_rows = FALSE,
+    cluster_columns = FALSE,
+    row_split = cluster_sort$cluster,
+    cluster_row_slices = FALSE,
+    show_row_names = show_row_names,
+    row_names_gp = gpar(fontsize = 6),
+    column_names_gp = gpar(fontsize = 6),
+    width = hm_width,
+    height = hm_height,
+    na_col = "white",
+    border = TRUE,
+    border_gp = gpar(col = "black", lty = 1, lwd = 0.5),
+    heatmap_legend_param = list(
+      title = legend_title,
+      title_gp = gpar(fontsize = 10),
+      labels_gp = gpar(fontsize = 8),
+      at = value_breaks,
+      labels = value_labels,
+      legend_height = unit(3, "cm"),
+      grid_width = unit(0.4, "cm"),
+      direction = "vertical"
+    )
+  )
+  draw(ht)
+  dev.off()
+}
+
+run_trajectory_analysis <- function(
+  analysis_kind,
+  work_dir,
+  data_dir,
+  data_file = "phase3.csv",
+  output_prefix = NULL,
+  # Time definition.
+  include_time0 = FALSE,
+  lag_years = 0,
+  user_max_years_before_diagnosis = Inf,
+  user_max_years_after_diagnosis = Inf,
+  time_step = 0.5,
+  anchor_tolerance_years = NULL,
+  # Matching and z-score.
+  match_ratio = 10,
+  min_controls_with_data = 3,
+  caliper = 0.2,
+  # LOESS.
+  loess_span = 0.3,
+  loess_degree = 2,
+  loess_family = "gaussian",
+  # Clustering.
+  k_mode = "auto",
+  manual_k = 3,
+  k_max = 6,
+  min_cluster_size = 3,
+  # Metabolite columns.
+  met_start = 25,
+  met_end = 337,
+  # Significant metabolite files.
+  assoc_files = NULL,
+  assoc_p_col = "Bon",
+  assoc_p_cutoff = 0.05,
+  # Medication-related optional sensitivity settings.
+  adjust_anti_epileptic = FALSE,
+  adjust_statin = FALSE,
+  exclude_anti_epileptic = FALSE,
+  exclude_statin = FALSE,
+  # Heatmap display.
+  raw_z_cap = 2,
+  heatmap_cell_width_mm = 1.8,
+  heatmap_cell_height_mm = 3.0,
+  seed = 123
+) {
+  stopifnot(analysis_kind %in% c("pre_diagnosis", "post_diagnosis"))
+  set.seed(seed)
+  dir.create(work_dir, recursive = TRUE, showWarnings = FALSE)
+  setwd(work_dir)
+  if (is.null(output_prefix)) output_prefix <- analysis_kind
+  output_prefix <- sanitize_tag(output_prefix)
+  input_file <- if (file.exists(data_file)) data_file else file.path(data_dir, data_file)
+  if (!file.exists(input_file)) stop("找不到数据文件：", input_file)
+  dat <- data.table::fread(input_file)
+  required_cols <- c(
+    "eid", "epi_status", "epi_years",
+    "Age", "Sex", "Ethnicity", "Qualifications", "TDI", "BMI",
+    "Smoking_status", "Drinking_status", "diet_score", "Fasting_time",
+    "DM", "hypertension", "eGFR_stage"
+  )
+  missing_required <- setdiff(required_cols, names(dat))
+  if (length(missing_required) > 0) stop("数据中缺少必要列：", paste(missing_required, collapse = ", "))
+  vars_used <- c(
+    "Age", "Sex", "Ethnicity", "Qualifications", "TDI", "BMI",
+    "Smoking_status", "Drinking_status", "diet_score", "Fasting_time",
+    "DM", "hypertension", "eGFR_stage"
+  )
+  dat <- dat[complete.cases(dat[, ..vars_used]), ]
+  dat <- dat %>% mutate(epi_status_num = safe01(epi_status))
+  if (anyNA(dat$epi_status_num) || !all(dat$epi_status_num %in% c(0L, 1L))) {
+    stop("epi_status 无法稳定转换为 0/1，请检查 epi_status 取值：", paste(unique(dat$epi_status), collapse = ", "))
+  }
+  # Optional medication exclusions before matching. These are sensitivity analyses, not default main-analysis settings.
+  if (exclude_anti_epileptic) {
+    if (!"anti_epileptic" %in% names(dat)) stop("需要排除 anti_epileptic users，但数据中没有 anti_epileptic 列。")
+    before_n <- nrow(dat)
+    dat <- dat[is_definite_zero(anti_epileptic), ]
+    cat("排除 anti_epileptic 非0或缺失者：", before_n - nrow(dat), " 行被排除。\n")
+  }
+  if (exclude_statin) {
+    if (!"statin" %in% names(dat)) stop("需要排除 statin users，但数据中没有 statin 列。")
+    before_n <- nrow(dat)
+    dat <- dat[is_definite_zero(statin), ]
+    cat("排除 statin 非0或缺失者：", before_n - nrow(dat), " 行被排除。\n")
+  }
+  factor_cols <- c(
+    "Sex", "Ethnicity", "Qualifications", "Smoking_status", "Drinking_status",
+    "DM", "hypertension", "eGFR_stage", "Imagingsite", "anti_epileptic", "statin"
+  )
+  missing_factor_cols <- setdiff(factor_cols, names(dat))
+  if (length(missing_factor_cols) > 0) {
+    warning("以下分类变量在数据中不存在，已跳过：", paste(missing_factor_cols, collapse = ", "))
+  }
+  dat <- dat %>% mutate(across(any_of(factor_cols), factor))
+  if (analysis_kind == "pre_diagnosis") {
+    pre_time_condition <- if (include_time0 && lag_years == 0) {
+      dat$epi_years >= lag_years
+    } else {
+      dat$epi_years > lag_years
+    }
+    base_candidate <- dat$epi_status_num == 1 & !is.na(dat$epi_years) & pre_time_condition
+    obs_max <- max(dat$epi_years[base_candidate], na.rm = TRUE)
+    if (!is.finite(obs_max)) stop("没有符合条件的 incident/pre-diagnosis 病例。")
+    upper_filter <- min(obs_max, user_max_years_before_diagnosis, na.rm = TRUE)
+    case_keep_condition <- base_candidate & dat$epi_years <= upper_filter
+    x_axis_label <- "Years before diagnosis"
+    heatmap_column_title <- "Years before diagnosis"
+  } else {
+    years_after <- -dat$epi_years
+    post_time_condition <- if (include_time0 && lag_years == 0) {
+      years_after >= lag_years
+    } else {
+      years_after > lag_years
+    }
+    base_candidate <- dat$epi_status_num == 1 & !is.na(dat$epi_years) & post_time_condition
+    obs_max <- max(years_after[base_candidate], na.rm = TRUE)
+    if (!is.finite(obs_max)) stop("没有符合条件的 prevalent/post-diagnosis 病例。")
+    upper_filter <- min(obs_max, user_max_years_after_diagnosis, na.rm = TRUE)
+    case_keep_condition <- base_candidate & years_after <= upper_filter
+    x_axis_label <- "Years after diagnosis"
+    heatmap_column_title <- "Years after diagnosis"
+  }
+  control_keep_condition <- dat$epi_status_num == 0
+  analysis_dat <- dat %>% filter(control_keep_condition | case_keep_condition)
+  if (sum(analysis_dat$epi_status_num == 1) < 2) stop("可用于轨迹分析的病例少于2个。")
+  # Raw case time support before matching.
+  if (analysis_kind == "pre_diagnosis") {
+    raw_case_support <- analysis_dat %>%
+      filter(epi_status_num == 1) %>%
+      mutate(years_from_diagnosis = epi_years, year_bin = floor(years_from_diagnosis)) %>%
+      count(year_bin, name = "n_cases_raw") %>%
+      arrange(year_bin)
+  } else {
+    raw_case_support <- analysis_dat %>%
+      filter(epi_status_num == 1) %>%
+      mutate(years_from_diagnosis = -epi_years, year_bin = floor(years_from_diagnosis)) %>%
+      count(year_bin, name = "n_cases_raw") %>%
+      arrange(year_bin)
+  }
+  data.table::fwrite(raw_case_support, sprintf("case_time_support_raw_%s.csv", output_prefix))
+  # Propensity score matching.
+  m.out <- MatchIt::matchit(
+    epi_status_num ~ Age + Sex + Ethnicity + Qualifications + TDI + BMI +
+      Smoking_status + Drinking_status + Fasting_time + diet_score +
+      DM + hypertension + eGFR_stage,
+    data = analysis_dat,
+    method = "nearest",
+    ratio = match_ratio,
+    exact = ~ Sex,
+    caliper = caliper,
+    replace = FALSE
+  )
+  capture.output(summary(m.out, un = TRUE), file = sprintf("matchit_balance_summary_%s.txt", output_prefix))
+  mdata <- MatchIt::match.data(m.out)
+  original_groups <- n_distinct(mdata$subclass)
+  mdata_clean <- mdata %>%
+    group_by(subclass) %>%
+    filter(
+      n() == match_ratio + 1,
+      sum(epi_status_num == 1) == 1,
+      sum(epi_status_num == 0) == match_ratio
+    ) %>%
+    ungroup()
+  removed_groups <- original_groups - n_distinct(mdata_clean$subclass)
+  if (n_distinct(mdata_clean$subclass) < 2) stop("完整匹配组少于2组，无法分析。")
+  # Align matched controls to the matched case diagnosis time.
+  mdata_aligned <- mdata_clean %>%
+    group_by(subclass) %>%
+    mutate(
+      case_epi_years = first(epi_years[epi_status_num == 1]),
+      time_scale = -case_epi_years
+    ) %>%
+    ungroup()
+   check_unique <- mdata_aligned %>%
+    group_by(subclass) %>%
+    summarise(n_unique = n_distinct(time_scale), .groups = "drop")
+  check_case <- mdata_aligned %>%
+    filter(epi_status_num == 1) %>%
+    mutate(check = abs(time_scale + epi_years) < 1e-6) %>%
+    summarise(all_correct = all(check), .groups = "drop")
+   print(summary(mdata_aligned$time_scale))
+  if (analysis_kind == "pre_diagnosis" && any(mdata_aligned$time_scale > 0, na.rm = TRUE)) {
+    stop("pre_diagnosis 分析中发现 time_scale > 0，说明混入诊断后病例。")
+  }
+  if (analysis_kind == "post_diagnosis" && any(mdata_aligned$time_scale < 0, na.rm = TRUE)) {
+    stop("post_diagnosis 分析中发现 time_scale < 0，说明混入诊断前病例。")
+  }
+
+  # Matched case time support.
+  matched_case_support <- mdata_aligned %>%
+    filter(epi_status_num == 1) %>%
+    mutate(years_from_diagnosis = abs(case_epi_years), year_bin = floor(years_from_diagnosis)) %>%
+    count(year_bin, name = "n_matched_cases") %>%
+    arrange(year_bin)
+  data.table::fwrite(matched_case_support, sprintf("case_time_support_matched_%s.csv", output_prefix))
+  # Residualise metabolites.
+  if (met_end > ncol(mdata_aligned)) stop("met_end 超过数据列数。当前 ncol = ", ncol(mdata_aligned))
+  met_cols <- names(mdata_aligned)[met_start:met_end]
+  met_cols <- met_cols[vapply(mdata_aligned[met_cols], is.numeric, logical(1))]
+  if (length(met_cols) < 2) stop("可用于分析的数值型代谢物少于2个。")
+  covars <- c(
+    "Age", "Sex", "Ethnicity", "Qualifications", "TDI",
+    "BMI", "Smoking_status", "Drinking_status",
+    "Fasting_time", "diet_score", "DM", "hypertension", "eGFR_stage"
+  )
+  if (adjust_anti_epileptic) {
+    if (!"anti_epileptic" %in% names(mdata_aligned)) stop("需要调整 anti_epileptic，但数据中没有 anti_epileptic 列。")
+    covars <- c(covars, "anti_epileptic")
+  }
+  if (adjust_statin) {
+    if (!"statin" %in% names(mdata_aligned)) stop("需要调整 statin，但数据中没有 statin 列。")
+    covars <- c(covars, "statin")
+  }
+  calc_residuals <- function(met, data, covars) {
+    f <- as.formula(paste(bt(met), "~", paste(bt(covars), collapse = " + ")))
+    fit <- lm(f, data = data, na.action = na.exclude)
+    residuals(fit)
+  }
+  mdata_aligned <- mdata_aligned %>% mutate(.row_id = row_number())
+  res_names <- paste0("res_", met_cols)
+  if (anyDuplicated(res_names)) stop("残差列名重复，请检查代谢物列名。")
+  res_dt <- data.table(.row_id = mdata_aligned$.row_id)
+  for (j in seq_along(met_cols)) {
+    if (j %% 25 == 0) cat("Residualising metabolite ", j, "/", length(met_cols), "\n", sep = "")
+    res_dt[[res_names[j]]] <- calc_residuals(met_cols[j], mdata_aligned, covars)
+  }
+  dat_res <- left_join(mdata_aligned, as_tibble(res_dt), by = ".row_id")
+  if (nrow(dat_res) != nrow(mdata_aligned)) stop("残差合并后行数不一致。")
+  data.table::fwrite(as.data.table(dat_res), sprintf("match_%s_epilepsy.csv", output_prefix))
+  # Matched-set Z scores.
+  compute_z_one_met <- function(met) {
+    res_col <- paste0("res_", met)
+    cols <- c("subclass", "epi_status_num", "time_scale", res_col)
+    tmp <- dat_res %>% select(all_of(cols))
+    names(tmp)[4] <- "value"
+    tmp %>%
+      group_by(subclass) %>%
+      filter(
+        sum(epi_status_num == 0 & !is.na(value)) >= min_controls_with_data,
+        sum(epi_status_num == 1 & !is.na(value)) == 1
+      ) %>%
+      summarise(
+        Year = first(time_scale),
+        case_value = value[epi_status_num == 1 & !is.na(value)][1],
+        control_mean = mean(value[epi_status_num == 0], na.rm = TRUE),
+        control_sd = sd(value[epi_status_num == 0], na.rm = TRUE),
+        n_control_nonmissing = sum(epi_status_num == 0 & !is.na(value)),
+        .groups = "drop"
+      ) %>%
+      mutate(metabolite = met, z = (case_value - control_mean) / control_sd) %>%
+      filter(is.finite(z), abs(z) < 10) %>%
+      select(subclass, metabolite, Year, z, n_control_nonmissing)
+  }
+  z_scores <- purrr::map_dfr(met_cols, compute_z_one_met)
+  if (nrow(z_scores) == 0) stop("没有生成任何 Z-score。")
+  data.table::fwrite(z_scores, sprintf("z_scores_%s.csv", output_prefix))
+  print(z_scores %>% summarise(min_Year = min(Year, na.rm = TRUE), median_Year = median(Year, na.rm = TRUE), max_Year = max(Year, na.rm = TRUE)))
+  z_time_bin_summary <- z_scores %>%
+    mutate(year_bin = if (analysis_kind == "pre_diagnosis") floor(abs(Year)) else floor(Year)) %>%
+    group_by(year_bin) %>%
+    summarise(
+      n_z_records = n(),
+      n_subclasses = n_distinct(subclass),
+      n_metabolites = n_distinct(metabolite),
+      .groups = "drop"
+    ) %>%
+    arrange(year_bin)
+  data.table::fwrite(z_time_bin_summary, sprintf("z_score_time_bin_summary_%s.csv", output_prefix))
+  TIME_GRID <- make_grid_from_observed(
+    z_scores$Year,
+    time_step = time_step,
+    analysis_kind = analysis_kind,
+    lag_years = lag_years,
+    anchor_tolerance_years = anchor_tolerance_years
+  )
+  cat("LOESS prediction grid: ", paste(range(TIME_GRID), collapse = " to "), "; n = ", length(TIME_GRID), "\n", sep = "")
+  grid_report <- data.frame(
+    observed_min_year = min(z_scores$Year, na.rm = TRUE),
+    observed_max_year = max(z_scores$Year, na.rm = TRUE),
+    grid_min_year = min(TIME_GRID),
+    grid_max_year = max(TIME_GRID),
+    time_step = time_step,
+    lag_years = lag_years,
+    anchor_tolerance_years = anchor_tolerance_years %||% time_step
+  )
+  data.table::fwrite(grid_report, sprintf("time_grid_report_%s.csv", output_prefix))
+  # LOESS smoothing.
+  empty_loess <- function() tibble(Year = numeric(), Estimate_loess = numeric(), SE_loess = numeric())
+  smooth_loess <- function(df, met, span = loess_span, time_grid = TIME_GRID) {
+    df <- df %>% filter(!is.na(Year), !is.na(z))
+    if (nrow(df) < 10) {
+      warning("代谢物 ", met, "：样本量仅 ", nrow(df), " 个，跳过 LOESS 拟合")
+      return(empty_loess())
+    }
+    if (n_distinct(df$Year) < 4) {
+      warning("代谢物 ", met, "：有效时间点少于4个，跳过 LOESS 拟合")
+      return(empty_loess())
+    }
+    if (sd(df$z, na.rm = TRUE) == 0) {
+      warning("代谢物 ", met, "：z 值无变异，跳过")
+      return(empty_loess())
+    }
+    fit <- tryCatch(
+      loess(z ~ Year, data = df, span = span, degree = loess_degree, family = loess_family,
+            control = loess.control(surface = "direct")),
+      error = function(e) { warning("代谢物 ", met, " LOESS 拟合失败：", e$message); NULL }
+    )
+    if (is.null(fit)) return(empty_loess())
+    pred <- tryCatch(
+      predict(fit, newdata = data.frame(Year = time_grid), se = TRUE),
+      error = function(e) { warning("代谢物 ", met, " LOESS 预测失败：", e$message); NULL }
+    )
+    if (is.null(pred)) return(empty_loess())
+    tibble(Year = time_grid, Estimate_loess = as.numeric(pred$fit), SE_loess = as.numeric(pred$se.fit))
+  }
+  loess_df <- z_scores %>%
+    group_by(metabolite) %>%
+    group_modify(~ smooth_loess(.x, met = .y$metabolite, span = loess_span, time_grid = TIME_GRID)) %>%
+    ungroup()
+  data.table::fwrite(loess_df, sprintf("trajectories_loess_%s.csv", output_prefix))
+  # Significant metabolites.
+  group_file <- file.path(data_dir, "metabolite/met_group.csv")
+  if (!file.exists(group_file)) stop("找不到分组文件：", group_file)
+  field_name <- data.table::fread(group_file)
+  names(field_name)[1] <- "Metabolite"
+  if (!"Group" %in% names(field_name)) stop("met_group.csv 中没有 Group 列。")
+  if (is.null(assoc_files)) assoc_files <- default_assoc_files(data_dir)
+  sig_metabolites <- extract_sig_metabolites(assoc_files, p_col = assoc_p_col, p_cutoff = assoc_p_cutoff)
+  sig_metabolites_df <- data.frame(Metabolite = sig_metabolites, stringsAsFactors = FALSE) %>%
+    left_join(as_tibble(field_name) %>% select(Metabolite, Group), by = "Metabolite") %>%
+    mutate(Group = ifelse(is.na(Group), "Unknown", Group)) %>%
+    arrange(Group, Metabolite)
+  cat("共同显著代谢物数量：", nrow(sig_metabolites_df), "\n")
+  data.table::fwrite(as.data.table(sig_metabolites_df), sprintf("sig_Bon_intersection_%s.csv", output_prefix))
+  sig_loess <- loess_df %>%
+    filter(metabolite %in% sig_metabolites) %>%
+    left_join(sig_metabolites_df, by = c("metabolite" = "Metabolite"))
+  if (nrow(sig_loess) == 0) stop("没有显著代谢物的轨迹数据。")
+  # Clustering.
+  heat_mat_wide <- sig_loess %>% pivot_wider(id_cols = c(metabolite, Group), names_from = Year, values_from = Estimate_loess)
+  all_na_cols <- sapply(heat_mat_wide[, -(1:2)], function(x) all(is.na(x)))
+  cat("全NA时间列：", paste(names(all_na_cols)[all_na_cols], collapse = ", "), "\n")
+  time_col_names <- names(all_na_cols)[!all_na_cols]
+  if (length(time_col_names) < 2) stop("LOESS 后可用于聚类的时间列少于2个。")
+  time_col_names <- time_col_names[order(as.numeric(time_col_names))]
+  heat_mat <- as.matrix(heat_mat_wide[, time_col_names])
+  rownames(heat_mat) <- heat_mat_wide$metabolite
+  time_grid <- as.numeric(time_col_names)
+  if (any(is.na(heat_mat))) {
+    warning("LOESS矩阵存在NA，剔除含有NA的代谢物。")
+    heat_mat <- heat_mat[complete.cases(heat_mat), , drop = FALSE]
+  }
+  if (nrow(heat_mat) < 2) stop("用于聚类的代谢物少于2个。")
+  heat_mat_scaled <- t(scale(t(heat_mat)))
+  nan_rows <- apply(heat_mat_scaled, 1, function(x) any(is.nan(x) | is.na(x)))
+  if (any(nan_rows)) {
+    warning("存在标准差为0或标准化失败的代谢物，已移除：", paste(rownames(heat_mat_scaled)[nan_rows], collapse = ", "))
+    heat_mat_scaled <- heat_mat_scaled[!nan_rows, , drop = FALSE]
+  }
+  if (nrow(heat_mat_scaled) < 2) stop("标准化后代谢物少于2个。")
+  heat_mat <- heat_mat[rownames(heat_mat_scaled), , drop = FALSE]
+  dist_mat <- dist(heat_mat_scaled, method = "euclidean")
+  fit_hclust <- hclust(dist_mat, method = "ward.D2")
+  k_max_eff <- min(k_max, nrow(heat_mat_scaled) - 1)
+  if (k_max_eff < 2) stop("代谢物数量不足，无法计算2类及以上聚类。")
+  k_candidates <- 2:k_max_eff
+  k_selection <- lapply(k_candidates, function(kk) {
+    cl <- cutree(fit_hclust, k = kk)
+    tab <- table(cl)
+    sil <- cluster::silhouette(cl, dist_mat)
+    data.frame(
+      k = kk,
+      avg_silhouette = mean(sil[, "sil_width"], na.rm = TRUE),
+      min_cluster_size = min(tab),
+      cluster_sizes = paste(as.integer(tab), collapse = ";"),
+      valid = all(tab >= min_cluster_size),
+      stringsAsFactors = FALSE
+    )
+  }) %>% bind_rows()
+  data.table::fwrite(k_selection, sprintf("k_selection_silhouette_summary_%s.csv", output_prefix))
+  print(k_selection)
+  if (k_mode == "auto") {
+    valid_k <- k_selection %>% filter(valid, is.finite(avg_silhouette))
+    if (nrow(valid_k) == 0) {
+      warning("没有满足最小 cluster size 要求的 k，改用 manual_k。")
+      k <- manual_k
+    } else {
+      k <- valid_k$k[which.max(valid_k$avg_silhouette)]
+    }
+  } else if (k_mode == "manual") {
+    k <- manual_k
+  } else {
+    stop("k_mode 只能是 'auto' 或 'manual'。")
+  }
+  p_k <- ggplot(k_selection, aes(x = k, y = avg_silhouette)) +
+    geom_point(size = 2) +
+    geom_line() +
+    geom_vline(xintercept = k, linetype = "dashed") +
+    theme_test() +
+    labs(x = "Number of clusters k", y = "Average silhouette width", title = "Silhouette-based cluster-number selection")
+  ggsave(sprintf("silhouette_k_selection_%s_selected_k%d.pdf", output_prefix, k), p_k, width = 6, height = 5, dpi = 300)
+  clusters <- cutree(fit_hclust, k = k)
+  names(clusters) <- rownames(heat_mat_scaled)
+  print(table(clusters))
+  cluster_full <- data.frame(Metabolite = names(clusters), cluster = as.integer(clusters), stringsAsFactors = FALSE)
+  cluster_df <- sig_metabolites_df %>%
+    left_join(cluster_full, by = "Metabolite") %>%
+    arrange(cluster, Group, Metabolite)
+  data.table::fwrite(as.data.table(cluster_df), sprintf("clustered_data_Metabolite_tidy_%s_k%d_scaled.csv", output_prefix, k))
+  pdf(sprintf("h_clust_eu_wardD2_%s_k%d.pdf", output_prefix, k), width = 10, height = 6)
+  plot(fit_hclust, cex = 0.5, main = sprintf("Hierarchical Clustering (Scaled, Euclidean, Ward.D2), k=%d", k))
+  rect.hclust(fit_hclust, k = k, border = "cadetblue")
+  dev.off()
+  # Cluster trajectories.
+  cluster_traj <- sig_loess %>%
+    left_join(cluster_df[, c("Metabolite", "cluster")], by = c("metabolite" = "Metabolite")) %>%
+    filter(!is.na(cluster))
+  base_cluster_colors <- c("#c22f2f", "#E18727", "#0072B5", "#20854E", "#7876B1", "#6F99AD", "#FFDC91", "#EE4C97")
+  base_cluster_colors_light <- c("#E79B91", "#F3D1AB", "#8FB4E1", "#89D181", "#C3C2DC", "#BCD6E0", "#FFE8B8", "#F6A5C9")
+  cluster_colors <- base_cluster_colors[seq_len(k)]
+  cluster_colors_light <- base_cluster_colors_light[seq_len(k)]
+  plot_list <- list()
+  for (i in seq_len(k)) {
+    cluster_data <- cluster_traj %>% filter(cluster == i)
+    if (nrow(cluster_data) == 0) next
+    avg_traj <- cluster_data %>%
+      group_by(Year) %>%
+      summarise(
+        n_met = sum(!is.na(Estimate_loess)),
+        avg_value = mean(Estimate_loess, na.rm = TRUE),
+        se_value = ifelse(n_met > 1, sd(Estimate_loess, na.rm = TRUE) / sqrt(n_met), 0),
+        .groups = "drop"
+      ) %>%
+      filter(is.finite(avg_value), is.finite(se_value))
+    p <- ggplot() +
+      geom_line(data = cluster_data, aes(x = Year, y = Estimate_loess, group = metabolite),
+                color = cluster_colors_light[i], alpha = 0.25, linewidth = 0.3) +
+      geom_ribbon(data = avg_traj, aes(x = Year, ymin = avg_value - 1.96 * se_value, ymax = avg_value + 1.96 * se_value),
+                  fill = cluster_colors_light[i], alpha = 0.2) +
+      geom_line(data = avg_traj, aes(x = Year, y = avg_value), color = cluster_colors[i], linewidth = 1.4) +
+      geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 0.3) +
+      theme_test() +
+      labs(title = paste("Cluster", i), x = x_axis_label, y = "Z score") +
+      scale_x_continuous(breaks = pretty(time_grid, n = 8)) +
+      theme(
+        axis.text = element_text(color = "black", size = 9),
+        axis.title = element_text(face = "bold", color = "black", size = 10),
+        axis.ticks = element_line(linewidth = 0.3),
+        legend.position = "none",
+        plot.title = element_text(hjust = 0.5, face = "bold")
+      )
+    plot_list[[i]] <- p
+  }
+  cluster_plots <- patchwork::wrap_plots(plot_list, ncol = 2)
+  ggsave(sprintf("cluster_trajectories_%s_k%d.pdf", output_prefix, k), cluster_plots,
+         width = 15 / 3 * 2, height = 7.5, dpi = 300)
+  # Heatmaps.
+  common_mets <- intersect(rownames(heat_mat), cluster_df$Metabolite)
+  heat_mat <- heat_mat[common_mets, , drop = FALSE]
+  heat_mat_scaled <- heat_mat_scaled[common_mets, , drop = FALSE]
+  cluster_df <- cluster_df %>% filter(Metabolite %in% common_mets, !is.na(cluster))
+  sort_idx <- if (analysis_kind == "pre_diagnosis") which.max(time_grid) else which.min(time_grid)
+  sort_val <- setNames(heat_mat[, sort_idx], rownames(heat_mat))
+  cluster_sort <- cluster_df %>%
+    left_join(data.frame(Metabolite = names(sort_val), sort_val = sort_val), by = "Metabolite") %>%
+    arrange(cluster, desc(sort_val))
+  met_order <- cluster_sort$Metabolite
+  heat_mat_sorted <- heat_mat[met_order, , drop = FALSE]
+  heat_mat_scaled_sorted <- heat_mat_scaled[met_order, , drop = FALSE]
+  cluster_colors_k <- cluster_colors[seq_len(k)]
+  names(cluster_colors_k) <- as.character(seq_len(k))
+  unique_groups <- sort(unique(cluster_sort$Group))
+  unique_groups[is.na(unique_groups)] <- "Unknown"
+  group_colors <- setNames(viridis(length(unique_groups)), unique_groups)
+  raw_range <- range(heat_mat_sorted, na.rm = TRUE)
+  raw_max <- max(abs(raw_range))
+  if (!is.finite(raw_max) || raw_max == 0) raw_max <- 1
+  raw_col_fun <- circlize::colorRamp2(c(-raw_max, 0, raw_max), c("dodgerblue4", "white", "darkred"))
+  plot_heatmap_matrix(
+    heat_mat_sorted, cluster_sort, k, cluster_colors_k, group_colors,
+    output_file = sprintf("full_heatmap_%s_k%d_rawZ_fullrange.pdf", output_prefix, k),
+    title = heatmap_column_title,
+    legend_title = "Z score",
+    value_breaks = c(-round(raw_max, 1), -round(raw_max/2, 1), 0, round(raw_max/2, 1), round(raw_max, 1)),
+    value_labels = c(-round(raw_max, 1), -round(raw_max/2, 1), 0, round(raw_max/2, 1), round(raw_max, 1)),
+    cell_width_mm = heatmap_cell_width_mm,
+    cell_height_mm = heatmap_cell_height_mm,
+    col_fun = raw_col_fun
+  )
+  data.table::fwrite(as.data.table(heat_mat_sorted, keep.rownames = "Metabolite"), sprintf("heatmap_matrix_%s_rawZ.csv", output_prefix))
+  data.table::fwrite(as.data.table(heat_mat_scaled_sorted, keep.rownames = "Metabolite"), sprintf("heatmap_matrix_%s_row_scaled.csv", output_prefix))
+  summary_df <- data.frame(
+    output_prefix = output_prefix,
+    analysis_kind = analysis_kind,
+    n_sig_metabolites = nrow(sig_metabolites_df),
+    n_clustered_metabolites = nrow(heat_mat_scaled_sorted),
+    selected_k = k,
+    loess_span = loess_span,
+    loess_degree = loess_degree,
+    loess_family = loess_family,
+    match_ratio = match_ratio,
+    caliper = caliper,
+    lag_years = lag_years,
+    exclude_anti_epileptic = exclude_anti_epileptic,
+    exclude_statin = exclude_statin,
+    adjust_anti_epileptic = adjust_anti_epileptic,
+    adjust_statin = adjust_statin
+  )
+  data.table::fwrite(summary_df, sprintf("analysis_summary_%s.csv", output_prefix))
+  invisible(list(
+    z_scores = z_scores,
+    loess_df = loess_df,
+    cluster_df = cluster_df,
+    k_selection = k_selection,
+    selected_k = k,
+    heat_mat = heat_mat_sorted,
+    heat_mat_scaled = heat_mat_scaled_sorted
+  ))
+}
