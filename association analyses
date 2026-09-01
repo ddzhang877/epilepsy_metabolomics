@@ -1,0 +1,579 @@
+library(tidyverse)
+library(lubridate)
+library(data.table)
+library(survival)
+
+#In the derivation/replication cohort,,same as FE/GE, OR subgroup analysis#
+#metabolite--prevalent epilepsy#
+derivation_epi_prevalent<- derivation %>% filter(!(epi_status==1 & epi_years>0))
+nrow(derivation_epi_prevalent)#epi=195562#
+table(derivation_epi_prevalent$epi_status)#epi=1556#
+str(derivation_epi_prevalent[,c(2:24)])
+colSums(is.na(derivation_epi_prevalent[,c(2:24)]))
+sum(!complete.cases(derivation_epi_prevalent[,c(2:14)]))
+vars_used <- c("Age","Sex","Ethnicity","Qualifications","TDI","BMI","Smoking_status","Drinking_status","diet_score","Fasting_time","DM","hypertension","eGFR_stage")
+derivation_epi_prevalent <- derivation_epi_prevalent[complete.cases(derivation_epi_prevalent[, ..vars_used]),]
+cat("Final N used in all models:", nrow(derivation_epi_prevalent), "\n") #model2=186212
+mydata1 <- derivation_epi_prevalent
+var1 <- colnames(mydata1)[25:337] 
+var2 <- "epi_status" 
+covars <- c("Age","Sex","Ethnicity","Qualifications","TDI","BMI","Smoking_status","Drinking_status","diet_score","Fasting_time","DM","hypertension","eGFR_stage")
+Result <- data.frame()
+for (j in seq_along(var1)) {
+  exposure <- var1[j]  
+  glm_formula <- paste0(
+    var2, " ~ ", exposure, " + ", paste(covars, collapse = "+"))  
+  glm_model <- glm(as.formula(glm_formula), data = mydata1, family = binomial(link = "logit"))  
+  x <- summary(glm_model)  
+  beta <- x$coefficients[2, "Estimate"]
+  se   <- x$coefficients[2, "Std. Error"]
+  pval <- x$coefficients[2, "Pr(>|z|)"] 
+  n    <- nobs(glm_model)  
+  or <- exp(beta)
+  or_lower <- exp(beta - 1.96 * se)
+  or_upper <- exp(beta + 1.96 * se)  
+  res <- data.frame(
+    Exposure = exposure,     
+    Outcome = var2,          
+    beta = sprintf("%.3f", beta),      
+    SE = sprintf("%.3f", se),        
+    OR = sprintf("%.3f", or),         
+    OR_95CI_lower = sprintf("%.3f", or_lower),  
+    OR_95CI_upper = sprintf("%.3f", or_upper), 
+    p.value = ifelse(pval < 0.001, "<0.001", sprintf("%.3f", pval)),
+    p.value.raw = pval,
+    N = n,
+    stringsAsFactors = FALSE)  
+  Result <- rbind(Result, res)  
+  if (j %% 10 == 0) cat("Finished:", j, "\n")
+}
+Result$p.value.raw <- as.numeric(Result$p.value.raw)
+Result$FDR_Q <- p.adjust(Result$p.value.raw, "fdr")
+Result$Bon <- p.adjust(Result$p.value.raw, "bonferroni")
+write.csv(Result, "derivation_pre_logistic.csv", row.names = FALSE)
+
+#metabolite--incident epilepsy#
+derivation_epi_incident<- derivation %>% filter(!(epi_status==1 & epi_years<0))
+nrow(derivation_epi_incident)
+table(derivation_epi_incident$epi_status)
+vars_used <- c("Age","Sex","Ethnicity","Qualifications","TDI","BMI","Smoking_status","Drinking_status","diet_score","Fasting_time","DM","hypertension","eGFR_stage")
+derivation_epi_incident <- derivation_epi_incident[complete.cases(derivation_epi_incident[, ..vars_used]),]
+cat("Final N used in all models:", nrow(derivation_epi_incident), "\n") 
+library(survival)
+mydata1<-derivation_epi_incident
+var1 <- colnames(mydata1)[25:337] ##Exposure#
+outcome <- "epi"
+covars <- c("Age","Sex","Ethnicity","Qualifications","TDI","BMI","Smoking_status","Drinking_status","diet_score","Fasting_time","DM","hypertension","eGFR_stage")
+Result <- data.frame()
+for (j in seq_along(var1)) { 
+  exposure <- var1[j]  
+  cox_formula <- paste0(
+    "Surv(", outcome, "_years, ", outcome, "_status == 1) ~ ",
+    exposure, " + ",
+    paste(covars, collapse = "+"))  
+  cox_model <- coxph(as.formula(cox_formula), data = mydata1)
+  x <- summary(cox_model)  
+  HR   <- x$coefficients[exposure, "exp(coef)"]
+  HR_l <- x$conf.int[exposure, "lower .95"]
+  HR_u <- x$conf.int[exposure, "upper .95"]
+  pval <- x$coefficients[exposure, "Pr(>|z|)"]  
+  n     <- x$n
+  nevent <- x$nevent  
+  res <- data.frame(
+    Exposure = exposure,
+    Outcome  = outcome,
+    event.prop = paste0(nevent, "/", n),
+    HR.95CI = paste0(
+      sprintf("%.2f", HR), " (",
+      sprintf("%.2f", HR_l), "-",
+      sprintf("%.2f", HR_u), ")"),
+    p.value.2 = ifelse(pval < 0.001, "<0.001", sprintf("%.3f", pval)),
+    HR = HR,
+    p.value = pval,
+    N = n,
+    stringsAsFactors = FALSE)  
+  Result <- rbind(Result, res)  
+  if (j %% 10 == 0) cat("Finished:", j, "\n")
+}
+Result$FDR_Q <- p.adjust(Result$p.value,"fdr")
+Result$Bon <- p.adjust(Result$p.value,"bonferroni")
+write.csv(Result,"derivation_incident.csv",row.names = F)
+
+
+######meta analysis--prevalent epilepsy/FE/GE######
+library(data.table)
+library(dplyr)
+derivation_pre <- fread("derivation_pre_logistic.csv")
+replication_pre <- fread("replication_pre_logistic.csv")
+derivation_pre <- derivation_pre %>%
+  select(
+    Exposure,
+    Outcome,
+    derivation_beta = beta,
+    derivation_SE = SE,
+    derivation_OR = OR,
+    derivation_OR_lower = OR_95CI_lower,
+    derivation_OR_upper = OR_95CI_upper,
+    derivation_p = p.value.raw,
+    derivation_N = N)
+replication_pre <- replication_pre %>%
+  select(
+    Exposure,
+    Outcome,
+    replication_beta = beta,
+    replication_SE = SE,
+    replication_OR = OR,
+    replication_OR_lower = OR_95CI_lower,
+    replication_OR_upper = OR_95CI_upper,
+    replication_p = p.value.raw,
+    replication_N = N)
+meta_pre <- inner_join(derivation_pre, replication_pre, by = c("Exposure", "Outcome"))
+meta_pre <- meta_pre %>%
+  mutate(
+    derivation_beta = as.numeric(derivation_beta),
+    derivation_SE = as.numeric(derivation_SE),
+    replication_beta = as.numeric(replication_beta),
+    replication_SE = as.numeric(replication_SE))
+meta_pre <- meta_pre %>%
+  mutate(
+    weight_derivation = 1 / derivation_SE^2,
+    weight_replication = 1 / replication_SE^2,
+    pooled_beta = (weight_derivation * derivation_beta + weight_replication * replication_beta) / (weight_derivation + weight_replication),
+    pooled_SE = sqrt(1 / (weight_derivation + weight_replication)),
+    z_meta = pooled_beta / pooled_SE,
+    p_meta = 2 * pnorm(
+      abs(z_meta),
+      lower.tail = FALSE),
+    pooled_OR = exp(pooled_beta),
+    pooled_OR_lower = exp(pooled_beta - 1.96 * pooled_SE),
+    pooled_OR_upper = exp(pooled_beta + 1.96 * pooled_SE),
+    Q = weight_derivation * (derivation_beta - pooled_beta)^2 + weight_replication * (replication_beta - pooled_beta)^2,
+    Q_df = 1,
+    Q_p = pchisq(Q, df = Q_df, lower.tail = FALSE),
+    I2 = ifelse(Q > 0, pmax(0, (Q - Q_df) / Q) * 100, 0),
+    derivation_weight_pct = weight_derivation / (weight_derivation + weight_replication) * 100,
+    replication_weight_pct = weight_replication / (weight_derivation + weight_replication) * 100)
+meta_pre <- meta_pre %>%
+  mutate(
+    FDR_Q_meta = p.adjust(p_meta,method = "fdr"),
+    Bonferroni_meta = p.adjust(p_meta,method = "bonferroni"),
+    Direction = case_when(
+      pooled_OR > 1 ~ "Higher risk",
+      pooled_OR < 1 ~ "Lower risk",
+      TRUE ~ "No association"),
+    Heterogeneity = case_when(
+      I2 < 25 ~ "Low",
+      I2 < 50 ~ "Moderate",
+      I2 < 75 ~ "Substantial",
+      TRUE ~ "Considerable"))
+meta_pre_results <- meta_pre %>%
+  select(
+    Exposure,
+    Outcome,
+    derivation_beta,
+    derivation_SE,
+    derivation_OR,
+    derivation_OR_lower,
+    derivation_OR_upper,
+    derivation_p,
+    derivation_N,
+    replication_beta,
+    replication_SE,
+    replication_OR,
+    replication_OR_lower,
+    replication_OR_upper,
+    replication_p,
+    replication_N,
+    pooled_beta,
+    pooled_SE,
+    pooled_OR,
+    pooled_OR_lower,
+    pooled_OR_upper,
+    z_meta,
+    p_meta,
+    FDR_Q_meta,
+    Bonferroni_meta,
+    Q,
+    Q_df,
+    Q_p,
+    I2,
+    derivation_weight_pct,
+    replication_weight_pct,
+    Direction,
+    Heterogeneity
+  ) %>%
+  arrange(p_meta)
+head(meta_pre_results, 20)
+meta_pre_bon <- meta_pre_results %>% filter(Bonferroni_meta < 0.05)
+fwrite(meta_pre_results,"meta_pre_logistic_all_results.csv")
+
+######meta-incident epilepsy/FE/GE#####
+library(tidyverse)
+derivation_data <- read.csv("~/result/associa_phase/meta/derivation_incident.csv",stringsAsFactors = FALSE, check.names = FALSE)
+replication_data <- read.csv("~/result/associa_phase/meta/replication_incident.csv",stringsAsFactors = FALSE, check.names = FALSE)
+required_cols <- c("Exposure","beta","SE","HR","HR_lower","HR_upper","p.value","FDR_Q","Bon","N","Event_n","event.prop")
+missing_derivation <- setdiff(required_cols, names(derivation_data))
+missing_replication <- setdiff(required_cols, names(replication_data))
+derivation_clean <- derivation_data %>%
+  transmute(
+    Exposure = trimws(Exposure),
+    beta_derivation = as.numeric(beta),
+    SE_derivation = as.numeric(SE),
+    HR_derivation = as.numeric(HR),
+    Lower_derivation = as.numeric(HR_lower),
+    Upper_derivation = as.numeric(HR_upper),
+    p_derivation = as.numeric(p.value),
+    FDR_derivation = as.numeric(FDR_Q),
+    Bon_derivation = as.numeric(Bon),
+    N_derivation = as.numeric(N),
+    Event_n_derivation = as.numeric(Event_n),
+    event.prop_derivation = event.prop)
+replication_clean <- replication_data %>%
+  transmute(
+    Exposure = trimws(Exposure),
+    beta_replication = as.numeric(beta),
+    SE_replication = as.numeric(SE),
+    HR_replication = as.numeric(HR),
+    Lower_replication = as.numeric(HR_lower),
+    Upper_replication = as.numeric(HR_upper),
+    p_replication = as.numeric(p.value),
+    FDR_replication = as.numeric(FDR_Q),
+    Bon_replication = as.numeric(Bon),
+    N_replication = as.numeric(N),
+    Event_n_replication = as.numeric(Event_n),
+    event.prop_replication = event.prop)
+dup_derivation <- derivation_clean %>% count(Exposure) %>% filter(n > 1)
+dup_replication <- replication_clean %>% count(Exposure) %>% filter(n > 1)
+merged_data <- inner_join(derivation_clean,replication_clean, by = "Exposure")
+only_derivation <- setdiff(derivation_clean$Exposure,replication_clean$Exposure)
+only_replication <- setdiff(replication_clean$Exposure, derivation_clean$Exposure)
+invalid_meta_input <- merged_data %>%
+  filter(
+    is.na(beta_derivation) |
+      is.na(SE_derivation) |
+      is.na(beta_replication) |
+      is.na(SE_replication) |
+      !is.finite(beta_derivation) |
+      !is.finite(SE_derivation) |
+      !is.finite(beta_replication) |
+      !is.finite(SE_replication) |
+      SE_derivation <= 0 |
+      SE_replication <= 0)
+meta_input <- merged_data %>%
+  filter(
+    is.finite(beta_derivation),
+    is.finite(SE_derivation),
+    is.finite(beta_replication),
+    is.finite(SE_replication),
+    SE_derivation > 0,
+    SE_replication > 0)
+meta_results <- meta_input %>%
+  mutate(
+    weight_derivation = 1 / SE_derivation^2,
+    weight_replication = 1 / SE_replication^2,
+    total_weight = weight_derivation + weight_replication,
+    pooled_beta = (weight_derivation * beta_derivation + weight_replication * beta_replication) / total_weight,
+    pooled_SE = sqrt(1 / total_weight),
+    pooled_HR = exp(pooled_beta),
+    pooled_lower = exp(pooled_beta - qnorm(0.975) * pooled_SE),
+    pooled_upper = exp(pooled_beta + qnorm(0.975) * pooled_SE),
+    z_meta = pooled_beta / pooled_SE,
+    p_meta = 2 * pnorm(-abs(z_meta)),
+    Q = weight_derivation * (beta_derivation - pooled_beta)^2 + weight_replication * (beta_replication - pooled_beta)^2,
+    Q_df = 1,
+    Q_p = pchisq(Q, df = Q_df, lower.tail = FALSE),
+    I2 = case_when(Q <= Q_df ~ 0, TRUE ~ 100 * (Q - Q_df) / Q),
+    weight_derivation_pct = 100 * weight_derivation / total_weight,
+    weight_replication_pct = 100 * weight_replication / total_weight,
+    Direction = case_when(
+      beta_derivation > 0 & beta_replication > 0 ~ "Consistent positive",
+      beta_derivation < 0 & beta_replication < 0 ~ "Consistent negative",
+      TRUE ~ "Inconsistent"))
+meta_test_n <- nrow(meta_results)
+meta_results <- meta_results %>%
+  mutate(
+    FDR_Q_meta = p.adjust(
+      p_meta,
+      method = "BH",
+      n = meta_test_n),
+    Bonferroni_meta = p.adjust(
+      p_meta,
+      method = "bonferroni",
+      n = meta_test_n),
+    Significance = case_when(
+      Bonferroni_meta < 0.01 ~ "**",
+      Bonferroni_meta < 0.05 ~ "*",
+      TRUE ~ ""))
+final_results <- meta_results %>%
+  mutate(
+    HR_derivation_fmt = sprintf(
+      "%.2f (%.2f-%.2f)",
+      HR_derivation,
+      Lower_derivation,
+      Upper_derivation),
+    HR_replication_fmt = sprintf(
+      "%.2f (%.2f-%.2f)",
+      HR_replication,
+      Lower_replication,
+      Upper_replication),
+    HR_pooled_fmt = sprintf(
+      "%.2f (%.2f-%.2f)",
+      pooled_HR,
+      pooled_lower,
+      pooled_upper)) %>%
+  select(
+    Exposure,
+    N_derivation,
+    Event_n_derivation,
+    event.prop_derivation,
+    beta_derivation,
+    SE_derivation,
+    HR_derivation,
+    Lower_derivation,
+    Upper_derivation,
+    HR_derivation_fmt,
+    p_derivation,
+    FDR_derivation,
+    Bon_derivation,
+    N_replication,
+    Event_n_replication,
+    event.prop_replication,
+    beta_replication,
+    SE_replication,
+    HR_replication,
+    Lower_replication,
+    Upper_replication,
+    HR_replication_fmt,
+    p_replication,
+    FDR_replication,
+    Bon_replication,
+    pooled_beta,
+    pooled_SE,
+    pooled_HR,
+    pooled_lower,
+    pooled_upper,
+    HR_pooled_fmt,
+    z_meta,
+    p_meta,
+    FDR_Q_meta,
+    Bonferroni_meta,
+    Q,
+    Q_df,
+    Q_p,
+    I2,
+    weight_derivation_pct,
+    weight_replication_pct,
+    Direction,
+    Significance
+  ) %>%
+  arrange(p_meta)
+significant_bon <- final_results %>% filter(Bonferroni_meta < 0.05) %>% arrange(p_meta)
+significant_fdr <- final_results %>% filter(FDR_Q_meta < 0.05) %>% arrange(p_meta)
+nominal_sig <- final_results %>% filter(p_meta < 0.05,FDR_Q_meta >= 0.05) %>% arrange(p_meta)
+output_dir <- paste0("~/result/associa_phase/meta/")
+if (!dir.exists(output_dir)) {dir.create(output_dir, recursive = TRUE)}
+write.csv(final_results,file.path(output_dir, "meta_epi_all_results.csv"),row.names = FALSE)
+write.csv(significant_bon,file.path(output_dir, "meta_epi_bon_significant.csv"),row.names = FALSE)
+summary_table <- final_results %>%
+  transmute(
+    Metabolite = Exposure,
+    derivation = HR_derivation_fmt,
+    P_derivation = p_derivation,
+    replication = HR_replication_fmt,
+    P_replication = p_replication,
+    Pooled = HR_pooled_fmt,
+    P_Meta = p_meta,
+    FDR_Q = FDR_Q_meta,
+    Bonferroni_P = Bonferroni_meta,
+    Q,
+    Q_P = Q_p,
+    I2,
+    Direction)
+write.csv(summary_table,file.path(output_dir,"meta_epi_summary_table.csv"), row.names = FALSE)
+
+
+####epilepsy-specific/all-cause death in epilepsy individuals####
+epi_death_in_epilepsy <- read.csv("~/death/epi_death_in_epilepsy.csv")
+epi_death_in_epilepsy<-merge(phase123[,1],epi_death_in_epilepsy,by="eid")
+epi_death_in_epilepsy <- epi_death_in_epilepsy %>%
+  select(eid, death_status = 6, earliest_date = 7, epi_status = 2, epi_date = 3) %>% 
+  mutate(
+    earliest_date = ymd(earliest_date),
+    epi_date = ymd(epi_date),
+    death_days = earliest_date - epi_date,
+    death_years = as.numeric(death_days) / 365.25 
+  )
+epi_death_in_epilepsy<-merge(cov_used[,c(1:14)],epi_death_in_epilepsy[,c(1,2,7)],by="eid")
+epi_death_in_epilepsy <- epi_death_in_epilepsy[!is.na(epi_death_in_epilepsy$death_years), ]
+epi_death_in_epilepsy<-merge(epi_death_in_epilepsy,metabolite[,c(1,5:317)],by="eid")
+epi_death_in_epilepsy <- epi_death_in_epilepsy %>% mutate(
+  death_status=factor(death_status),Sex=factor(Sex),Ethnicity=factor(Ethnicity),
+  Qualifications=factor(Qualifications),Smoking_status=factor(Smoking_status),Drinking_status=factor(Drinking_status),
+  DM=factor(DM),hypertension=factor(hypertension),eGFR_stage=factor(eGFR_stage))
+vars_used <- c("Age","Sex","Ethnicity","Qualifications","TDI","BMI","Smoking_status","Drinking_status","diet_score","Fasting_time")
+epi_death_in_epilepsy <- epi_death_in_epilepsy[complete.cases(epi_death_in_epilepsy[, vars_used]),]
+vars_used <- c("Age","Sex","Ethnicity","Qualifications","TDI","BMI","Smoking_status","Drinking_status","diet_score","Fasting_time","DM","hypertension","eGFR_stage")
+epi_death_in_epilepsy <- epi_death_in_epilepsy[complete.cases(epi_death_in_epilepsy[, vars_used]),]
+cat("Final N used in all models:", nrow(epi_death_in_epilepsy), "\n") 
+library(survival)
+mydata1<-epi_death_in_epilepsy
+var1 <- colnames(mydata1)[17:329]
+outcome <- "death"
+covars <- c("Age","Sex","Ethnicity","Qualifications","TDI","BMI","Smoking_status","Drinking_status","diet_score","Fasting_time","DM","hypertension","eGFR_stage")
+Result <- data.frame()
+for (j in seq_along(var1)) { 
+  exposure <- var1[j]  
+  cox_formula <- paste0(
+    "Surv(", outcome, "_years, ", outcome, "_status == 1) ~ ",
+    exposure, " + ",
+    paste(covars, collapse = "+"))  
+  cox_model <- coxph(as.formula(cox_formula), data = mydata1)
+  x <- summary(cox_model)  
+  HR   <- x$coefficients[exposure, "exp(coef)"]
+  HR_l <- x$conf.int[exposure, "lower .95"]
+  HR_u <- x$conf.int[exposure, "upper .95"]
+  pval <- x$coefficients[exposure, "Pr(>|z|)"]  
+  n     <- x$n
+  nevent <- x$nevent  
+  res <- data.frame(
+    Exposure = exposure,
+    Outcome  = outcome,
+    event.prop = paste0(nevent, "/", n),
+    HR.95CI = paste0(
+      sprintf("%.2f", HR), " (",
+      sprintf("%.2f", HR_l), "-",
+      sprintf("%.2f", HR_u), ")"),
+    p.value.2 = ifelse(pval < 0.001, "<0.001", sprintf("%.3f", pval)),
+    HR = HR,
+    p.value = pval,
+    N = n,
+    stringsAsFactors = FALSE)  
+  Result <- rbind(Result, res)  
+  if (j %% 10 == 0) cat("Finished:", j, "\n")
+}
+Result$FDR_Q <- p.adjust(Result$p.value,"fdr")
+Result$Bon <- p.adjust(Result$p.value,"bonferroni")
+write.csv(Result,"epi_death_inepi.csv",row.names = F)
+
+
+##metabolites - DTI/cortical surface associations analysis#
+DTI<-fread("~/brain_structure/DTI_original.csv")
+colnames(DTI)<-gsub('_i2','',colnames(DTI))
+bs_DTI<-merge(met_cov,DTI,by="eid")
+bs_DTI<-as.data.frame(bs_DTI)
+nrow(bs_DTI)#29550#
+ncol(bs_DTI)#120#
+head(bs_DTI[,c(1:18)])
+colnames(bs_DTI[,c(67:120)])
+colSums(is.na(bs_DTI[,c(1:18,67:120)]))
+min((bs_DTI)[67:120])
+library(car)
+var1 <- colnames(bs_DTI)[67:120]
+var2 <- paste0(var1,'log')
+for (i in 1:length(var1)) {
+  bs_DTI[[var2[[i]]]] <- log10(bs_DTI[[var1[[i]]]]+1)
+}
+bs_DTI<-bs_DTI[,-c(67:120)]
+str(bs_DTI[,c(2:18)])
+mydata1 <- bs_DTI 
+var1 <- colnames(mydata1)[67:120]
+var2 <- colnames(mydata1)[19:66]##Exposure
+var3 <- c('+Age+Sex+Ethnicity+Qualifications+TDI+BMI+Smoking_status+Drinking_status+Fasting_time+diet_score+DM+hypertension+eGFR_stage+Imagingsite')
+Result <- list()
+for (i in 1:length(var2)) {
+  for (j in 1:length(var1)) {
+    result <- list()
+    for (k in 1:length(var3)) {
+      lm_formula <- paste0('scale(',var1[[j]],') ~ ',var2[[i]],var3[[k]])
+      lm_model <- lm(lm_formula,data = mydata1)
+      x <- summary(lm_model)
+      Var1 <- var1[[j]]
+      Var2 <- var2[[i]]
+      Var3 <- k
+      p.value <- ifelse(x[["coefficients"]][2,4]<0.001,'<0.001',sprintf('%0.3f',x[["coefficients"]][2,4]))
+      p.value.raw <- x[["coefficients"]][2,4]
+      beta <- sprintf('%0.3f',x[["coefficients"]][2,1])
+      res<-c(Var1,Var2, beta, p.value,p.value.raw)
+      names(res)<-c("Outcome","Exposure","beta", "p.value",'p.value.raw')
+      res <- as.data.frame(t(as.data.frame(res)))
+      result <- rbind(result,res)
+      rm(res)
+      print(j)
+    }
+    Result <- rbind(Result,result)
+  }
+}
+lm_result <- Result
+lm_result$p.value.raw <- as.numeric(lm_result$p.value.raw)
+lm_result$FDR_Q <- p.adjust(lm_result$p.value.raw,"fdr")
+lm_result$Bon <- p.adjust(lm_result$p.value.raw,"bonferroni")
+lm_result <- lm_result %>%
+  left_join(met_name, by = c("Exposure" = "Metabolite")) %>%
+  mutate(Exposure = Final_name) %>%
+  select(-Final_name)
+lm_result <- lm_result %>%
+  left_join(Dictionary, by = c("Outcome" = "Field_ID")) %>%
+  mutate(Outcome = Description) %>%
+  select(-Description)
+write.csv(lm_result,"met_DTI_result.csv",row.names = F)
+
+
+###metabolites - WMH/whole brain/subcortical volume/cortical volume/cortical thickness associations analasis#
+WMH<-fread("~/brain_structure/WMH_original.csv")
+colnames(WMH)<-gsub('_i2','',colnames(WMH))
+bs_WMH<-merge(met_cov,WMH,by="eid")
+bs_WMH<-as.data.frame(bs_WMH)
+nrow(bs_WMH)#29835#
+ncol(bs_WMH)#69#
+colSums(is.na(bs_WMH[,c(1:18,67:69)]))
+head(bs_WMH[,c(67:69)])
+min((bs_DTI)[67:69])
+library(car)
+var1 <- colnames(bs_WMH)[67:69]
+var2 <- paste0(var1,'log')
+for (i in 1:length(var1)) {
+  bs_WMH[[var2[[i]]]] <- log10(bs_WMH[[var1[[i]]]]+1)
+}
+bs_WMH<-bs_WMH[,-c(67:69)]
+str(bs_WMH[,c(2:18)])
+mydata1 <- bs_WMH 
+var1 <- colnames(mydata1)[67:69]
+var2 <- colnames(mydata1)[19:66]##Exposure
+var3 <- c('+Age+Sex+Ethnicity+Qualifications+TDI+BMI+Smoking_status+Drinking_status+Fasting_time+diet_score+DM+hypertension+eGFR_stage+Imagingsite+ICV')
+Result <- list()
+for (i in 1:length(var2)) {
+  for (j in 1:length(var1)) {
+    result <- list()
+    for (k in 1:length(var3)) {
+      lm_formula <- paste0('scale(',var1[[j]],') ~ ',var2[[i]],var3[[k]])
+      lm_model <- lm(lm_formula,data = mydata1)
+      x <- summary(lm_model)
+      Var1 <- var1[[j]]
+      Var2 <- var2[[i]]
+      Var3 <- k
+      p.value <- ifelse(x[["coefficients"]][2,4]<0.001,'<0.001',sprintf('%0.3f',x[["coefficients"]][2,4]))
+      p.value.raw <- x[["coefficients"]][2,4]
+      beta <- sprintf('%0.3f',x[["coefficients"]][2,1])
+      res<-c(Var1,Var2, beta, p.value,p.value.raw)
+      names(res)<-c("Outcome","Exposure","beta", "p.value",'p.value.raw')
+      res <- as.data.frame(t(as.data.frame(res)))
+      result <- rbind(result,res)
+      rm(res)
+      print(j)
+    }
+    Result <- rbind(Result,result)
+  }
+}
+lm_result <- Result
+lm_result$p.value.raw <- as.numeric(lm_result$p.value.raw)
+lm_result$FDR_Q <- p.adjust(lm_result$p.value.raw,"fdr")
+lm_result$Bon <- p.adjust(lm_result$p.value.raw,"bonferroni")
+lm_result <- lm_result %>%
+  left_join(met_name, by = c("Exposure" = "Metabolite")) %>%
+  mutate(Exposure = Final_name) %>%
+  select(-Final_name)
+lm_result <- lm_result %>%
+  left_join(Dictionary, by = c("Outcome" = "Field_ID")) %>%
+  mutate(Outcome = Description) %>%
+  select(-Description)
+write.csv(lm_result,"met_WMH_result.csv",row.names = F)
