@@ -1,0 +1,108 @@
+##mediation analysis##
+scaled_columns <- scale(bs_DTI[, c(67:120)])#imaging column#
+scaled_DTI <- data.frame(bs_DTI[, c(1:66)], scaled_columns)
+library(data.table)
+library(dplyr)
+final_data <- fread("sig_image.csv")
+scaled_DTI <- fread("scaled_DTI.csv")
+scaled_DTI <- scaled_DTI %>% mutate(
+  epi_status=factor(epi_status),Sex=factor(Sex),Ethnicity=factor(Ethnicity),Qualifications=factor(Qualifications),
+  Qualifications=factor(Qualifications),Smoking_status=factor(Smoking_status),Drinking_status=factor(Drinking_status),DM=factor(DM),
+  hypertension=factor(hypertension),eGFR_stage=factor(eGFR_stage),Imagingsite=factor(Imagingsite))
+exposure_names <- unique(final_data$Field_ID)
+all_columns <- names(scaled_DTI)
+columns_image <- all_columns[67:120]
+matched_columns <- columns_image[columns_image %in% exposure_names]
+library(naniar)
+prop_miss <- colMeans(is.na(scaled_DTI_filtered))
+scaled_DTI_filtered <- na.omit(scaled_DTI_filtered)
+str(scaled_DTI_filtered[,c(2:18)])
+library("mediation")
+all_results <- list()
+independent_vars <- names(scaled_DTI_filtered)[19:66]
+mediator_vars <- matched_columns
+for (iv in independent_vars) {
+  for (mv in mediator_vars) {
+    if (iv %in% names(scaled_DTI_filtered) && mv %in% names(scaled_DTI_filtered)) {      
+      formula_dv <- as.formula(paste("epi_status ~", mv, "+", iv, "+Age+Sex+Ethnicity+Qualifications+TDI+BMI+Smoking_status+Drinking_status+Fasting_time+diet_score+DM+hypertension+eGFR_stage+Imagingsite"))
+      formula_mediator <- as.formula(paste(mv, "~", iv, "+Age+Sex+Ethnicity+Qualifications+TDI+BMI+Smoking_status+Drinking_status+Fasting_time+diet_score+DM+hypertension+eGFR_stage+Imagingsite"))      
+      fit.dv <- glm(formula_dv, family = binomial(link = logit), data = scaled_DTI_filtered)
+      fit.mediator <- lm(formula_mediator, data = scaled_DTI_filtered)      
+      m1_coef <- coef(summary(fit.mediator))[2, ]
+      M1_row <- data.frame(
+        Estimate = m1_coef["Estimate"],
+        SE       = m1_coef["Std. Error"],
+        Statistic = m1_coef["t value"],
+        P_value   = m1_coef["Pr(>|t|)"],
+        CI_low    = NA,
+        CI_high   = NA
+      )      
+      m2_coef <- coef(summary(fit.dv))[2, ]
+      M2_row <- data.frame(
+        Estimate = m2_coef["Estimate"],
+        SE       = m2_coef["Std. Error"],
+        Statistic = m2_coef["z value"],
+        P_value   = m2_coef["Pr(>|z|)"],
+        CI_low    = NA,
+        CI_high   = NA
+      )      
+      results <- mediate(fit.mediator, fit.dv, treat = iv, mediator = mv, sims = 5000)
+      SUM <- summary(results)     
+      ACME_row <- data.frame(
+        Estimate = SUM$d.avg,
+        SE       = NA,                       
+        Statistic = NA,
+        P_value   = SUM$d.avg.p,
+        CI_low    = SUM$d.avg.ci[1],
+        CI_high   = SUM$d.avg.ci[2]
+      )      
+      ADE_row <- data.frame(
+        Estimate = SUM$z.avg,
+        SE       = NA,
+        Statistic = NA,
+        P_value   = SUM$z.avg.p,
+        CI_low    = SUM$z.avg.ci[1],
+        CI_high   = SUM$z.avg.ci[2]
+      )      
+      Prop_row <- data.frame(
+        Estimate = SUM$n.avg,
+        SE       = NA,
+        Statistic = NA,
+        P_value   = SUM$n.avg.p,
+        CI_low    = SUM$n.avg.ci[1],
+        CI_high   = SUM$n.avg.ci[2]
+      )      
+      Total_row <- data.frame(
+        Estimate = SUM$tau.coef,
+        SE       = NA,
+        Statistic = NA,
+        P_value   = SUM$tau.p,
+        CI_low    = SUM$tau.ci[1],
+        CI_high   = SUM$tau.ci[2]
+      )      
+      results_data <- data.frame(
+        Estimate = c(M1_row$Estimate, M2_row$Estimate, ACME_row$Estimate,
+                     ADE_row$Estimate, Prop_row$Estimate, Total_row$Estimate),
+        SE       = c(M1_row$SE, M2_row$SE, ACME_row$SE,
+                     ADE_row$SE, Prop_row$SE, Total_row$SE),
+        Statistic = c(M1_row$Statistic, M2_row$Statistic, ACME_row$Statistic,
+                      ADE_row$Statistic, Prop_row$Statistic, Total_row$Statistic),
+        P_value   = c(M1_row$P_value, M2_row$P_value, ACME_row$P_value,
+                      ADE_row$P_value, Prop_row$P_value, Total_row$P_value),
+        CI_low    = c(M1_row$CI_low, M2_row$CI_low, ACME_row$CI_low,
+                      ADE_row$CI_low, Prop_row$CI_low, Total_row$CI_low),
+        CI_high   = c(M1_row$CI_high, M2_row$CI_high, ACME_row$CI_high,
+                      ADE_row$CI_high, Prop_row$CI_high, Total_row$CI_high),
+        model     = c("M1", "M2", "ACME", "ADE", "Prop", "Total"),
+        iv        = iv,
+        mv        = mv
+      )      
+      all_results[[paste(iv, mv, sep = "_")]] <- results_data      
+    } else {
+      cat("Variable", iv, "or", mv, "not found in the data frame.\n")
+    }
+  }
+}
+all_results <- data.table::rbindlist(all_results)
+write.csv(all_results, "media_48met_DTI.csv", row.names = FALSE)
+
